@@ -1,0 +1,87 @@
+name: Deploy React to DO
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: 'Select environment to deploy'
+        options:
+          - development
+          - production
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+
+      - name: Install & Build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DOCR_TOKEN }}
+        
+      - name: Log in to DigitalOcean Container Registry with short-lived credentials
+        run: doctl registry login --expiry-seconds 600
+
+      - name: Prune old images
+        env:
+          REPO: nest-app
+        run: |
+          set -euo pipefail
+
+          doctl registry repository list-manifests $REPO --format Digest,UpdatedAt --no-header \
+          | sort -k2 \
+          | awk '{print $1}' \
+          | while read -r digest; do
+              echo "Deleting manifest: $digest"
+              doctl registry repository delete-manifest $REPO $digest --force
+            done
+
+          doctl registry garbage-collection start --include-untagged-manifests --force
+
+      - name: Build & Push Docker Image
+        env:
+          REGISTRY: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/react-app:$IMAGE_TAG .
+          docker push $REGISTRY/react-app:$IMAGE_TAG
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: ${{ secrets.DOCR_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+          script: |
+            REGISTRY=registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}
+            TAG=${{ github.sha }}
+            docker login -u ${{ secrets.DOCR_TOKEN }} -p ${{ secrets.DOCR_TOKEN }} registry.digitalocean.com
+            docker stop react-app || true
+            docker rm react-app  || true
+            docker pull $REGISTRY/react-app:$TAG
+            docker run -d \
+              --name react-app \
+              -p 3000:3000 \
+              -e MONGO_URI="${{ secrets.MONGO_URI }}" \
+              --restart unless-stopped \
+              $REGISTRY/react-app:$TAG
